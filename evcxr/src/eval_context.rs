@@ -1217,6 +1217,8 @@ pub struct ContextState {
     allow_question_mark: bool,
     build_num: i32,
     pub(crate) config: Config,
+    /// [patch.crates-io] entries: crate name → TOML config string.
+    pub(crate) crates_io_patches: HashMap<String, String>,
 }
 
 impl ContextState {
@@ -1233,6 +1235,7 @@ impl ContextState {
             allow_question_mark: false,
             build_num: 0,
             config,
+            crates_io_patches: HashMap::new(),
         }
     }
 
@@ -1503,6 +1506,23 @@ impl ContextState {
             .map(|krate| format!("{} = {}\n", krate.name, krate.config))
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    pub(crate) fn format_cargo_patches(&self) -> String {
+        if self.crates_io_patches.is_empty() {
+            return String::new();
+        }
+        let mut entries: Vec<String> = self
+            .crates_io_patches
+            .iter()
+            .map(|(name, cfg)| format!("{name} = {cfg}"))
+            .collect();
+        entries.sort();
+        format!("\n[patch.crates-io]\n{}\n", entries.join("\n"))
+    }
+
+    pub fn add_crates_io_patch(&mut self, name: String, config: String) {
+        self.crates_io_patches.insert(name, config);
     }
 
     fn compilation_mode(&self) -> CompilationMode {
@@ -2199,6 +2219,39 @@ mod tests {
                 "#![allow(unused_imports,unused_mut,dead_code)]".to_owned(),
                 "#![feature(some_other_feature)]".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_format_cargo_patches_empty() {
+        let state = create_state();
+        assert_eq!(state.format_cargo_patches(), "");
+    }
+
+    #[test]
+    fn test_format_cargo_patches_single() {
+        let mut state = create_state();
+        state.add_crates_io_patch(
+            "my-crate".to_owned(),
+            r#"{ path = "/home/user/my-crate" }"#.to_owned(),
+        );
+        assert_eq!(
+            state.format_cargo_patches(),
+            "\n[patch.crates-io]\nmy-crate = { path = \"/home/user/my-crate\" }\n"
+        );
+    }
+
+    #[test]
+    fn test_format_cargo_patches_multiple_sorted() {
+        let mut state = create_state();
+        // Insert in reverse alphabetical order to verify sorting is applied.
+        state.add_crates_io_patch("zebra".to_owned(), r#"{ path = "/p/zebra" }"#.to_owned());
+        state.add_crates_io_patch("alpha".to_owned(), r#"{ path = "/p/alpha" }"#.to_owned());
+        state.add_crates_io_patch("middle".to_owned(), r#"{ path = "/p/middle" }"#.to_owned());
+        let result = state.format_cargo_patches();
+        assert_eq!(
+            result,
+            "\n[patch.crates-io]\nalpha = { path = \"/p/alpha\" }\nmiddle = { path = \"/p/middle\" }\nzebra = { path = \"/p/zebra\" }\n"
         );
     }
 }
