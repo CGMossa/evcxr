@@ -668,6 +668,7 @@ impl EvalContext {
     pub(crate) fn restart_child_process(&mut self) -> Result<(), Error> {
         self.committed_state.variable_states.clear();
         self.committed_state.stored_variable_states.clear();
+        self.committed_state.moved_variable_names.clear();
         self.child_process = self.child_process.restart()?;
         Ok(())
     }
@@ -974,10 +975,12 @@ impl EvalContext {
                     if error.code() == Some("E0382") {
                         // Use of moved value.
                         state.variable_states.remove(variable_name);
+                        state.moved_variable_names.insert(variable_name.clone());
                         fixed_errors.insert("Captured value");
                     } else if error.code() == Some("E0425") {
                         // cannot find value in scope.
                         state.variable_states.remove(variable_name);
+                        state.moved_variable_names.insert(variable_name.clone());
                         fixed_errors.insert("Variable moved");
                     } else if error.code() == Some("E0603") {
                         if let Some(variable_state) = state.variable_states.remove(variable_name) {
@@ -1212,6 +1215,11 @@ pub struct ContextState {
     /// code was executed. Doesn't include newly defined variables until after
     /// execution completes.
     stored_variable_states: HashMap<String, VariableState>,
+    /// Names of variables that were previously bound but have since been moved
+    /// (and thus removed from `variable_states`). When the user writes a bare
+    /// assignment `name = expr` for one of these tombstoned names, we rewrite
+    /// it to `let mut name = expr` so it becomes a fresh binding.
+    moved_variable_names: HashSet<String>,
     attributes: HashMap<String, CodeBlock>,
     async_mode: bool,
     allow_question_mark: bool,
@@ -1228,6 +1236,7 @@ impl ContextState {
             extern_crate_stmts: HashMap::new(),
             variable_states: HashMap::new(),
             stored_variable_states: HashMap::new(),
+            moved_variable_names: HashSet::new(),
             attributes: HashMap::new(),
             async_mode: false,
             allow_question_mark: false,
@@ -1941,7 +1950,7 @@ impl ContextState {
                         }
                     }
                 }
-            } else {
+            } else if !self.try_rewrite_tombstone_assign(node, &segment, &mut code_out) {
                 code_out = code_out.with_segment(segment);
             }
         }
@@ -1950,6 +1959,79 @@ impl ContextState {
 
     fn dependency_lib_names(&self) -> Result<Vec<String>> {
         cargo_metadata::get_library_names(&self.config)
+    }
+
+    /// If `node` is a bare `name = expr` assignment where `name` is in the
+    /// tombstone set (`moved_variable_names`), rewrite it to `let mut name =
+    /// expr`, register the variable as a fresh binding, and return `true`.
+    /// Returns `false` if this is not a tombstone-reassignment case.
+    fn try_rewrite_tombstone_assign(
+        &mut self,
+        node: &SyntaxNode,
+        _segment: &Segment,
+        code_out: &mut CodeBlock,
+    ) -> bool {
+        // Extract the name and rhs-text from a plain `name = expr` node.
+        // The node may be an ExprStmt (semicoloned form: `s = expr;`) or a
+        // bare BinExpr (last-expression form without semicolon). Returns None
+        // for anything that doesn't match.
+        let extract = || -> Option<(String, String)> {
+            // Unwrap ExprStmt to get the inner expression if needed.
+            let expr_node = if let Some(stmt) = ast::ExprStmt::cast(node.clone()) {
+                stmt.expr()?.syntax().clone()
+            } else {
+                node.clone()
+            };
+            let bin_expr = ast::BinExpr::cast(expr_node)?;
+            // Only plain `=`, not `+=` / `-=` / etc.
+            if bin_expr.op_kind() != Some(ast::BinaryOp::Assignment { op: None }) {
+                return None;
+            }
+            // LHS must be a simple path (single identifier, no qualifiers).
+            let path_expr = match bin_expr.lhs()? {
+                ast::Expr::PathExpr(p) => p,
+                _ => return None,
+            };
+            let path = path_expr.path()?;
+            // Reject qualified paths like `foo::bar`.
+            if path.qualifier().is_some() {
+                return None;
+            }
+            let name = path.segment()?.name_ref()?.text().to_string();
+            let rhs_text = bin_expr.rhs()?.syntax().text().to_string();
+            Some((name, rhs_text))
+        };
+
+        let (name, rhs_text) = match extract() {
+            Some(v) => v,
+            None => return false,
+        };
+
+        if !self.moved_variable_names.contains(&name) {
+            return false;
+        }
+
+        // Rewrite `name = rhs` → `let mut name = rhs;` as purely generated
+        // code (traceability is lost, but this matches single-cell behavior).
+        *code_out = code_out
+            .clone()
+            .generated(format!("let mut {name} = {rhs_text};"));
+
+        // Register as a fresh variable. Type starts as "String" (the existing
+        // fix_variable_types loop will correct it via the first compile error).
+        self.variable_states.insert(
+            name.clone(),
+            VariableState {
+                type_name: "String".to_owned(),
+                is_mut: true,
+                move_state: VariableMoveState::New,
+                definition_span: None,
+            },
+        );
+        // Clear tombstone so a second bare-assignment in the same cell doesn't
+        // re-trigger (and a fresh `let name` in record_local also clears it).
+        self.moved_variable_names.remove(&name);
+        true
     }
 
     fn record_new_locals(
@@ -2003,8 +2085,11 @@ impl ContextState {
             _ => "String".to_owned(),
         };
         if let Some(name) = ast::HasName::name(&pat_ident) {
+            let name_str = name.text().to_string();
+            // A fresh `let` binding supersedes any tombstone for this name.
+            self.moved_variable_names.remove(&name_str);
             self.variable_states.insert(
-                name.text().to_string(),
+                name_str,
                 VariableState {
                     type_name,
                     is_mut: pat_ident.mut_token().is_some(),
@@ -2172,6 +2257,55 @@ mod tests {
         )
         .unwrap();
         ContextState::new(config)
+    }
+
+    /// Verify that a bare assignment to a tombstoned (previously moved) variable
+    /// is rewritten to `let mut name = rhs` by `ContextState::apply`.
+    /// Reproduces the scenario from evcxr/evcxr#428.
+    #[test]
+    fn test_tombstone_reassign_rewritten_to_let_mut() {
+        let mut state = create_state();
+        // Simulate: `s` was previously moved — mark it as a tombstone.
+        state.moved_variable_names.insert("s".to_owned());
+
+        // Cell 3 from the issue: `s = String::from("world");`
+        let (user_code, code_info) =
+            CodeBlock::from_original_user_code(r#"s = String::from("world");"#);
+        let rewritten = state.apply(user_code, &code_info.nodes).unwrap();
+        let generated = rewritten.code_string();
+
+        // The bare assignment must be rewritten as a fresh let-mut binding.
+        assert!(
+            generated.contains("let mut s ="),
+            "Expected `let mut s =` in generated code, got: {generated}"
+        );
+        // The tombstone must be cleared after rewriting.
+        assert!(
+            !state.moved_variable_names.contains("s"),
+            "Tombstone for `s` should be cleared after rewrite"
+        );
+        // The variable must be registered in variable_states.
+        assert!(
+            state.variable_states.contains_key("s"),
+            "Variable `s` should be registered in variable_states after rewrite"
+        );
+    }
+
+    /// A fresh `let` binding clears the tombstone so that subsequent bare
+    /// assignments in later cells are NOT incorrectly rewritten.
+    #[test]
+    fn test_let_binding_clears_tombstone() {
+        let mut state = create_state();
+        state.moved_variable_names.insert("s".to_owned());
+
+        let (user_code, code_info) =
+            CodeBlock::from_original_user_code(r#"let s = String::from("fresh");"#);
+        state.apply(user_code, &code_info.nodes).unwrap();
+
+        assert!(
+            !state.moved_variable_names.contains("s"),
+            "Tombstone for `s` should be cleared by a fresh `let` binding"
+        );
     }
 
     #[test]
