@@ -537,6 +537,29 @@ Panic detected. Here's some useful information if you're filing a bug report.
                 },
             ),
             AvailableCommand::new(
+                ":features",
+                "Set/clear features for the generated crate. e.g. :features foo,bar",
+                |_ctx, state, args| {
+                    match args.as_deref() {
+                        None => {}
+                        Some(list) => {
+                            let features: Vec<String> = list
+                                .split(',')
+                                .map(|s| s.trim().to_owned())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            state.set_features(features);
+                        }
+                    }
+                    let current = state.features().join(", ");
+                    if current.is_empty() {
+                        text_output("features: (none)")
+                    } else {
+                        text_output(format!("features: {current}"))
+                    }
+                },
+            ),
+            AvailableCommand::new(
                 ":offline",
                 "Set offline mode when invoking cargo (0/1)",
                 |_ctx, state, args| {
