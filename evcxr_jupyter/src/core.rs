@@ -840,4 +840,117 @@ mod tests {
         assert_eq!(byte_offset_to_grapheme_offset(src, 6).unwrap(), 2);
         assert_eq!(byte_offset_to_grapheme_offset(src, 7).unwrap(), 3);
     }
+
+    // --- error_reply_info tests ---
+
+    // The ename field is always "Error" regardless of the variant.
+    // The evalue is the Display representation for non-CompilationErrors variants,
+    // and the first compilation error message for CompilationErrors.
+
+    #[test]
+    fn error_reply_info_message_variant() {
+        let err = evcxr::Error::Message("something went wrong".to_string());
+        let (ename, evalue) = error_reply_info(&err);
+        assert_eq!(ename, "Error");
+        assert_eq!(evalue, "something went wrong");
+    }
+
+    #[test]
+    fn error_reply_info_subprocess_terminated_variant() {
+        let err = evcxr::Error::SubprocessTerminated("process died".to_string());
+        let (ename, evalue) = error_reply_info(&err);
+        assert_eq!(ename, "Error");
+        assert_eq!(evalue, "process died");
+    }
+
+    #[test]
+    fn error_reply_info_type_redefined_variables_lost() {
+        let err =
+            evcxr::Error::TypeRedefinedVariablesLost(vec!["foo".to_string(), "bar".to_string()]);
+        let (ename, evalue) = error_reply_info(&err);
+        assert_eq!(ename, "Error");
+        // The Display impl lists the lost variable names.
+        assert!(
+            evalue.contains("foo"),
+            "evalue should mention lost variable 'foo', got: {evalue}"
+        );
+        assert!(
+            evalue.contains("bar"),
+            "evalue should mention lost variable 'bar', got: {evalue}"
+        );
+    }
+
+    #[test]
+    fn error_reply_info_compilation_errors_empty_list() {
+        // An empty CompilationErrors vec: first() returns None, so evalue is "".
+        let err = evcxr::Error::CompilationErrors(vec![]);
+        let (ename, evalue) = error_reply_info(&err);
+        assert_eq!(ename, "Error");
+        assert_eq!(evalue, "");
+    }
+
+    // --- kernel_info tests ---
+    //
+    // kernel_info() is a pure, infallible function with no server state; it is
+    // directly accessible from the test module via `use super::*`.
+
+    #[test]
+    fn kernel_info_protocol_version() {
+        let info = kernel_info();
+        assert_eq!(
+            info["protocol_version"].as_str(),
+            Some("5.3"),
+            "Jupyter protocol version must be 5.3"
+        );
+    }
+
+    #[test]
+    fn kernel_info_language_info_fields() {
+        let info = kernel_info();
+        let lang = &info["language_info"];
+
+        assert_eq!(lang["name"].as_str(), Some("Rust"));
+        assert_eq!(lang["mimetype"].as_str(), Some("text/rust"));
+        assert_eq!(lang["file_extension"].as_str(), Some(".rs"));
+        // The spec field was renamed from pygment_lexer to pygments_lexer in this PR.
+        assert_eq!(
+            lang["pygments_lexer"].as_str(),
+            Some("rust"),
+            "pygments_lexer (with 's') must be present"
+        );
+        // The old misspelled key must be absent.
+        assert!(
+            lang["pygment_lexer"].is_null(),
+            "pygment_lexer (without 's') must not be set"
+        );
+        assert_eq!(lang["codemirror_mode"].as_str(), Some("rust"));
+        // nbconvert_exporter was added in this PR.
+        assert_eq!(
+            lang["nbconvert_exporter"].as_str(),
+            Some("rust"),
+            "nbconvert_exporter must be present"
+        );
+    }
+
+    #[test]
+    fn kernel_info_version_is_non_empty_string() {
+        let info = kernel_info();
+        // When rustc is present (as it always is in the test environment), the
+        // version field must be a non-empty string like "rustc 1.xx.y ...".
+        let version = info["language_info"]["version"].as_str().unwrap_or("");
+        assert!(
+            !version.is_empty(),
+            "language_info.version should be populated from `rustc --version`"
+        );
+        assert!(
+            version.starts_with("rustc "),
+            "version should start with 'rustc ', got: {version}"
+        );
+    }
+
+    #[test]
+    fn kernel_info_status_ok() {
+        let info = kernel_info();
+        assert_eq!(info["status"].as_str(), Some("ok"));
+    }
 }
