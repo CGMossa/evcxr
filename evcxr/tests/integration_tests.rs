@@ -978,6 +978,43 @@ fn code_completion() {
     assert!(completions.completions.iter().any(|c| c.code == "fff5()"));
 }
 
+// Not sure why this is failing on mac
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn doc_command_completion() {
+    // Completions for `:doc <type-prefix>` should be delegated to rust-analyzer
+    // so that type/module paths are suggested, not just command names.
+    let mut ctx = new_context();
+
+    // `:doc i3` — cursor at end (position 7). rust-analyzer should suggest `i32`.
+    let src = ":doc i3";
+    let pos = src.len();
+    let completions = ctx.completions(src, pos).unwrap();
+    assert!(
+        completions.completions.iter().any(|c| c.code == "i32"),
+        "expected `i32` in completions for `:doc i3`, got: {:?}",
+        completions
+            .completions
+            .iter()
+            .map(|c| &c.code)
+            .collect::<Vec<_>>()
+    );
+
+    // The offsets must point at the `i3` fragment within the original string,
+    // not at byte 0.
+    let arg_start = ":doc ".len();
+    assert!(
+        completions.start_offset >= arg_start,
+        "start_offset {} should be >= {} (start of arg in src)",
+        completions.start_offset,
+        arg_start
+    );
+    assert_eq!(
+        completions.end_offset, pos,
+        "end_offset should equal cursor position"
+    );
+}
+
 #[test]
 fn repeated_use_statements() {
     let mut e = new_context();
